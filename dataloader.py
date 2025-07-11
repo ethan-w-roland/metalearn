@@ -42,7 +42,3 @@ def create_loader(bin_path, block_size, batch_size, num_workers=4, device="cuda"
     # wrap to auto-transfer to GPU asynchronously
     for cpu_batch in dl:
         yield cpu_batch.to(device, non_blocking=True)
-
-# Example usage:
-# for batch in create_loader("./tiny_bin/train.bin", 2048, 8):
-#     ...

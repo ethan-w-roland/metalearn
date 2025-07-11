@@ -25,7 +25,7 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    ds  = load_dataset("roneneldan/TinyStories", split="train")
+    ds  = load_dataset("SimpleStories/SimpleStories", split="train")
     ds  = ds.train_test_split(test_size=0.01, seed=42)
     tok = GPT2TokenizerFast.from_pretrained(args.tokenizer)
 
