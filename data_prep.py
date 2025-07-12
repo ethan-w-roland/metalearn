@@ -13,7 +13,7 @@ logging.set_verbosity(40)
 def memmap_write(
     fname: Path,
     arr: List,
-    dtype: np.dtype = np.uint16,
+    dtype: np.dtype = np.uint32,
 ) -> None:
 
     total = sum(len(a) for a in arr)
@@ -33,9 +33,7 @@ def prepare_and_tokenize_dataset(
 
     dset_name = "SimpleStories/SimpleStories"
     train_ds = load_dataset(dset_name, split="train")
-    train_ds = train_ds.map(lambda ex: {"split": "train"}, num_proc=num_proc)
     test_ds = load_dataset(dset_name, split="test")
-    test_ds = test_ds.map(lambda ex: {"split": "test"}, num_proc=num_proc)
     
     print("Dataset columns:", train_ds.column_names)
 
@@ -92,7 +90,7 @@ def write_datasets_and_metadata(
         memmap_write(
             out_path,
             subset["ids"],
-            np.uint16,
+            np.uint32,
         )
 
         # ---------- per‑split statistics ----------
@@ -130,7 +128,7 @@ def run(out_dir: Path, num_proc: int, max_length: int) -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
 
     datasets = prepare_and_tokenize_dataset(
         num_proc=num_proc,

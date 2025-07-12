@@ -5,7 +5,7 @@ Minimal GPT-like transformer with built-in LoRA adapters.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Optional
 import torch, torch.nn as nn
 from torch.nn import functional as F
 
@@ -13,154 +13,142 @@ from torch.nn import functional as F
 class Config:
     vocab_size: int = 50257
     block_size: int = 512
+    embed_dim: int = 512
+    mlp_dim: int = 512 * 4
     n_layer: int = 8
-    n_head: int = 6
-    n_embd: int = 512
-    r: int = 8
+    n_head: int = 8
+    n_kv: int = 2
 
-# ---------- LoRA wrapper ---------------------------------------------------- #
-class LoRALinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, r: int = 16, bias: bool = True):
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int = 65536) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(in_features, out_features))
-        self.bias = nn.Parameter(torch.zeros(in_features)) if bias else None
 
-        # LoRA: B (out×r) @ A (r×in)
-        self.r = r
-        self.A = nn.Parameter(torch.empty(in_features, r))
-        self.B = nn.Parameter(torch.empty(r, out_features))
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim // 4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim // 4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor, use_lora: bool):
-        out = x @ self.weight.T + self.bias
-        if use_lora:
-            lora_out = x @ self.B @ self.A
-            out += lora_out
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cos = self.cos[None, : x.size(-3), None, :]
+        sin = self.sin[None, : x.size(-3), None, :]
+        x1, x2 = x.float().chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x)
 
-def rope_cache(seq_len: int, dim: int, device, dtype, theta: float = 10000.0):
-    """Return cos/sin caches of shape [seq_len, dim//2]."""
-    pos = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(1)
-    idx = torch.arange(0, dim, 2, device=device, dtype=dtype)
-    freqs = 1.0 / (theta ** (idx / dim))
-    ang = pos * freqs                                    # [T, dim//2]
-    return torch.cos(ang), torch.sin(ang)                # each [T, dim//2]
-
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """Rotate last-dim pairs (… d0 d1 d2 d3 …) in-place."""
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    y  = torch.stack((x1 * cos - x2 * sin,
-                      x1 * sin + x2 * cos), dim=-1)
-    return y.flatten(-2)
 
 class Attention(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.n_head  = config.n_head
-        self.head_dim= config.n_embd // config.n_head
 
-        self.key   = LoRALinear(config.n_embd, config.n_embd, r=config.r)
-        self.query = LoRALinear(config.n_embd, config.n_embd, r=config.r)
-        self.value = LoRALinear(config.n_embd, config.n_embd, r=config.r)
-        self.proj  = LoRALinear(config.n_embd, config.n_embd, r=config.r)
+        self.n_head = config.n_head
+        self.head_dim = config.embed_dim // config.n_head
+        self.n_kv = config.n_kv
 
-        # RoPE caches – initialised lazily on first forward pass
-        self.register_buffer("rope_cos", torch.empty(0), persistent=False)
-        self.register_buffer("rope_sin", torch.empty(0), persistent=False)
+        assert config.embed_dim % config.n_head == 0
+        assert config.n_head % config.n_kv == 0
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, use_lora: bool):
+        # attention projection
+        self.c_attn_q = nn.Linear(config.embed_dim, config.embed_dim, bias=True)
+
+        # key and value projection
+        self.c_attn_kv = nn.Linear(config.embed_dim, 2 * config.n_kv * self.head_dim, bias=True)
+
+        # rotary embedding
+        self.rotary = Rotary(config.embed_dim // config.n_head)
+
+        # output projection (same as attention projection)
+        self.c_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=True)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         B, T, C = x.size()
 
-        # --- projections --------------------------------------------------- #
-        q = self.query(x, use_lora).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # [B,H,T,D]
-        k = self.key  (x, use_lora).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.value(x, use_lora).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q = self.c_attn_q(x)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # --- rotary position embedding ------------------------------------- #
-        if self.rope_cos.numel() < T * (self.head_dim // 2):
-            cos, sin = rope_cache(T, self.head_dim, x.device, x.dtype)
-            self.rope_cos, self.rope_sin = cos, sin
-        cos = self.rope_cos[:T];  sin = self.rope_sin[:T]                 # [T, D/2]
+        k = self.c_attn_kv(x)
+        k, v = k.split(self.n_kv * self.head_dim, dim=2)
 
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        k = k.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, gqa=True)
-
-        y = attn_out.transpose(1, 2).contiguous().view(B, T, C)            # [B,T,C]
-        y = self.proj(y, use_lora)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
 
         return y
 
 class MLP(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.fc1 = LoRALinear(config.n_embd, 4*config.n_embd)
-        self.fc2 = LoRALinear(4*config.n_embd, config.n_embd)
+        self.fc1 = nn.Linear(config.embed_dim, config.mlp_dim)
+        self.fc2 = nn.Linear(config.mlp_dim, config.embed_dim)
         self.act = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, use_lora: bool):
-        x = self.fc1(x, use_lora)
+    def forward(self, x: torch.Tensor):
+        x = self.fc1(x)
         x = self.act(x)
-        x = self.fc2(x, use_lora)
+        x = self.fc2(x)
         return x
 
 class Block(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.norm1 = nn.RMSNorm(config.n_embd)
+        self.norm1 = nn.RMSNorm(config.embed_dim)
         self.attn= Attention(config)
-        self.norm2 = nn.RMSNorm(config.n_embd)
+        self.norm2 = nn.RMSNorm(config.embed_dim)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, use_lora: bool):
-        x = x + self.attn(self.norm1(x), mask, use_lora)
-        x = x + self.mlp (self.norm2(x), use_lora)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        x = x + self.attn(self.norm1(x), mask)
+        x = x + self.mlp (self.norm2(x))
         return x
 
 # ---------- full Transformer ----------------------------------------------- #
 class Transformer(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.inp_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.inp_emb = nn.Embedding(config.vocab_size, config.embed_dim)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.norm = nn.RMSNorm(config.n_embd)
-        self.out_emb = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.norm = nn.RMSNorm(config.embed_dim)
+        self.out_emb = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
+        self.inp_emb.weight = self.out_emb.weight
         self.apply(self._init_weights)
 
-    # weight init identical to nanoGPT
     def _init_weights(self, module): 
-        if isinstance(module, (nn.Linear, LoRALinear)):
+        if isinstance(module, nn.Linear):
             nn.init.kaiming_normal_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        if isinstance(module, LoRALinear):
-            nn.init.kaiming_normal_(module.A)
-            nn.init.zeros_(module.B)
 
-    # helpers to select param groups
-    def base_parameters(self) -> Iterator[nn.Parameter]:
-        for n,p in self.named_parameters():
-            if ".A" in n or ".B" in n:  # LoRA params
-                continue
-            yield p
-
-    def meta_parameters(self) -> Iterator[nn.Parameter]:
-        for n,p in self.named_parameters():
-            if ".A" in n or ".B" in n:
-                yield p
-
-    def token_embed(self, x: torch.Tensor) -> torch.Tensor:
+    def embed_in(self, x: torch.Tensor) -> torch.Tensor:
         return self.inp_emb(x)
-    
-    def logit_embed(self, x: torch.Tensor) -> torch.Tensor:
-        return x.T @ self.inp_emb.weight #needed b/c logits can be "soft tokens"
 
-    def forward(self, embed: torch.Tensor, mask: torch.Tensor, meta: bool = False):
-        x = embed
+    def embed_out(self, x: torch.Tensor) -> torch.Tensor:
+        return self.out_emb(x)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # If no attention mask is supplied, create a standard causal mask so that
+        # each position can only attend to positions at or before its own index.
+        if mask is None:
+            # x has shape (B, T, C) where T is the sequence length.
+            T = x.size(1)
+            mask = torch.triu(
+                torch.full((T, T), float("-inf"), device=x.device, dtype=x.dtype),
+                diagonal=1,
+            )
+
         for blk in self.blocks:
-            x = blk(x, mask, use_lora=meta)
+            x = blk(x, mask)
         x = self.norm(x)
-        x = self.out_emb(x)
         return x

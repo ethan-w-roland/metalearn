@@ -1,0 +1,15 @@
+{
+  "train": {
+    "total_tokens": 177565225,
+    "example": "In a quiet village, a boy named Leo watched as the sky turned to dusk. It was a time of magic when shadows grew long. He remembered a festival from his childhood, filled with laughter and lights. Everyone danced under the stars, and he felt alive. \n\nThat night, he watched a firework burst above him, lighting up the sky. He closed his eyes, feeling the power of joy all around. The colors painted his dreams, filling him with hope. He wanted to catch that light and keep it forever. \n\nNow, as he stood in the fading light, he felt that same excitement. The stars began to twinkle, and he smiled. With a deep breath, he promised himself to bring joy to others, just like that magical night. The sky was his canvas, and he was ready to paint it with happiness.<|end_of_text|>"
+  },
+  "test": {
+    "total_tokens": 1782080,
+    "example": "Amidst the silence of the sea, a small boat drifted alone. A young pirate sat quietly, staring at the stars. He felt lost and unsure, thinking he would never find his way. But deep inside, a fire burned. He recalled tales of great explorers and their bold hearts.\n\nAfter many nights of sailing, he spotted land. With new hope, he steered his boat toward the shore. The beach welcomed him with warm sands and bright colors. He knew that with courage, he could face any storm. The stars had guided him, and he was ready for new adventures.<|end_of_text|>"
+  },
+  "all": {
+    "total_tokens_train": 177565225,
+    "total_tokens_test": 1782080,
+    "vocab_size": 128256
+  }
+}
