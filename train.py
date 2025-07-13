@@ -10,11 +10,10 @@ import torch.optim as optim
 import torch.nn.functional as F
 from model import Transformer, Config
 from dataloader import DataLoader
-from copy import deepcopy
 from transformers import AutoTokenizer
 
 def make_mask(tokens: torch.Tensor, eos_token_id: int) -> torch.Tensor:
-    bsz, seq_len = tokens.size()
+    _, seq_len = tokens.size()
     device = tokens.device
     eos_mask = tokens == eos_token_id
     seg_ids = torch.cumsum(eos_mask.int(), dim=1) - eos_mask.int()
@@ -54,7 +53,8 @@ def run(
     # --- Model & Loaders ---
 
     tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
-    vocab_size = load_vocab(data_dir) + 1 # add [LOSS] token
+    vocab_size = load_vocab(data_dir)
+    vocab_size += 1 # add [LOSS] token
     config = Config(vocab_size=vocab_size, block_size=block_size)
     model = Transformer(config).to(device)
 
@@ -66,7 +66,7 @@ def run(
     loader = DataLoader(
         filename=f"{data_dir}/train.bin",
         B=batch_size,
-        T=block_size + block_size // 2, #128 + 256
+        T=block_size + block_size // 2,
         device=device)
 
     # --- Optimizers ---
@@ -84,34 +84,34 @@ def run(
         outer_data_x = outer_data[:, :-1]
         outer_data_y = outer_data[:, 1:]
 
-        # --- Initialize Inner Model ---
+        # --- Initialize Inner Optimizer ---
 
         opt_inner = optim.SGD(model.parameters(), lr=lr_inner)
 
         with higher.innerloop_ctx(
                 model, opt_inner,
                 copy_initial_weights=False,
-                track_higher_grads=True) as (fmodel, diffopt):
+                track_higher_grads=True) as (inner_model, diff_opt_inner):
 
             # --- Inner Optimizer ---
 
-            embed = fmodel.embed_in(inner_data)
+            embed = inner_model.embed_in(inner_data)
             mask = make_mask(inner_data[:, :-1], eos_token_id)
-            embed_out = fmodel(embed[:, :-1], mask=mask)
-            loss_embed = fmodel.embed_in(torch.tensor([[loss_token_id]], device=device))
+            embed_out = inner_model(embed[:, :-1], mask=mask)
+            loss_embed = inner_model.embed_in(torch.tensor([[loss_token_id]], device=device))
             loss_embed = loss_embed.repeat(batch_size, 1, 1) #repeat over batch
 
             meta_inp = torch.cat([embed, embed_out, loss_embed], dim=1)
             inner_loss = model(meta_inp)
             inner_loss = inner_loss[:, -1, :].mean() #last position
-            diffopt.step(inner_loss)
+            diff_opt_inner.step(inner_loss)
 
             # --- Outer Optimizer ---
 
             mask = make_mask(outer_data_x, eos_token_id)
-            embed = fmodel.embed_in(outer_data_x)
-            embed_out = fmodel(embed, mask=mask)
-            logits = fmodel.embed_out(embed_out)
+            embed = inner_model.embed_in(outer_data_x)
+            embed_out = inner_model(embed, mask=mask)
+            logits = inner_model.embed_out(embed_out)
 
             outer_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
@@ -126,14 +126,14 @@ def run(
 
             # --- Interpolate Models ---
 
-            interpolate_models(model, fmodel)
+            interpolate_models(model, inner_model)
             
             # --- Logging ---
 
             ppl = torch.exp(outer_loss.detach()).item()
             print(f"{step:>6}  critic={outer_loss.item():.3f}  val-ppl={ppl:6.2f}")
 
-        del fmodel, diffopt, opt_inner
+        del inner_model, diff_opt_inner, opt_inner
         torch.cuda.empty_cache()
 
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir",    default="./data")
     ap.add_argument("--batch_size",  type=int, default=64)
-    ap.add_argument("--block_size",  type=int, default=256) #aka context length
+    ap.add_argument("--block_size",  type=int, default=256) #context length
     ap.add_argument("--lr_inner",    type=float, default=3e-4)
     ap.add_argument("--lr_outer",    type=float, default=1e-3)
     args = ap.parse_args()
