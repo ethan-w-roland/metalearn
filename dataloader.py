@@ -18,7 +18,7 @@ class TokenDataset(Dataset):
         self.T = T
         
         # Load tokens as memory map
-        self.tokens = np.memmap(filename, dtype=np.uint32, mode='r')
+        self.tokens = np.memmap(filename, dtype=np.uint16, mode='r')
         self.num_tokens = len(self.tokens)
         
         # The number of sequences that can be formed

@@ -13,7 +13,7 @@ logging.set_verbosity(40)
 def memmap_write(
     fname: Path,
     arr: List,
-    dtype: np.dtype = np.uint32,
+    dtype: np.dtype = np.uint16,
 ) -> None:
 
     total = sum(len(a) for a in arr)
@@ -89,8 +89,7 @@ def write_datasets_and_metadata(
         # write tokens
         memmap_write(
             out_path,
-            subset["ids"],
-            np.uint32,
+            subset["ids"]
         )
 
         # ---------- per‑split statistics ----------
@@ -128,7 +127,7 @@ def run(out_dir: Path, num_proc: int, max_length: int) -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
+    tokenizer = AutoTokenizer.from_pretrained("SimpleStories/SimpleStories-1.25M")
 
     datasets = prepare_and_tokenize_dataset(
         num_proc=num_proc,
