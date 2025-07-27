@@ -5,6 +5,7 @@ Minimal GPT-like transformer with built-in LoRA adapters.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import Optional
 import torch, torch.nn as nn
 from torch.nn import functional as F
 
@@ -17,8 +18,6 @@ class Config:
     n_layer: int = 8
     n_head: int = 8
     n_kv: int = 2
-    eos_id: int = -1
-
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 65536) -> None:
@@ -66,7 +65,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor | None = None,
+        mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         B, T, C = x.size()
@@ -83,7 +82,7 @@ class Attention(nn.Module):
         k = F.rms_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
 
-        y = F.scaled_dot_product_attention(q, k, v, enable_gqa=True, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
 
@@ -110,7 +109,7 @@ class Block(nn.Module):
         self.norm2 = nn.RMSNorm(config.embed_dim)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
         x = x + self.attn(self.norm1(x), mask)
         x = x + self.mlp (self.norm2(x))
         return x
@@ -119,14 +118,12 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.eos_id = config.eos_id
         self.inp_emb = nn.Embedding(config.vocab_size, config.embed_dim)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.norm = nn.RMSNorm(config.embed_dim)
         self.out_emb = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
         self.inp_emb.weight = self.out_emb.weight
         self.apply(self._init_weights)
-        print(f"Instantiated Model with {sum(p.numel() for p in self.parameters())} parameters")
 
     def _init_weights(self, module): 
         if isinstance(module, nn.Linear):
@@ -134,21 +131,24 @@ class Transformer(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def make_mask(self, tokens: torch.Tensor) -> torch.Tensor:
+    def embed_in(self, x: torch.Tensor) -> torch.Tensor:
+        return self.inp_emb(x)
 
-        _, T = tokens.shape
-        dev   = tokens.device
-        causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=dev))
-        eos   = tokens.eq(self.eos_id)
-        seg   = torch.cumsum(eos.int(), 1) - eos.int() # segment IDs
-        same  = seg.unsqueeze(2).eq(seg.unsqueeze(1))  # same segment
-        return (same & causal).unsqueeze(1)
+    def embed_out(self, x: torch.Tensor) -> torch.Tensor:
+        return self.out_emb(x)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # If no attention mask is supplied, create a standard causal mask so that
+        # each position can only attend to positions at or before its own index.
+        if mask is None:
+            # x has shape (B, T, C) where T is the sequence length.
+            T = x.size(1)
+            mask = torch.triu(
+                torch.full((T, T), float("-inf"), device=x.device, dtype=x.dtype),
+                diagonal=1,
+            )
 
-        x = self.inp_emb(x)
         for blk in self.blocks:
             x = blk(x, mask)
         x = self.norm(x)
-        x = self.out_emb(x)
         return x

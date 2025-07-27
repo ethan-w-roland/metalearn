@@ -1,14 +1,11 @@
-import argparse, json, os, torch
+import argparse, json, os, torch, copy
 import torch.nn.functional as F
 import torch.optim as optim
-from model_2 import Transformer, Config
+from model import Transformer, Config
 from dataloader import DataLoader
 from transformers import AutoTokenizer
 
 
-# --------------------------------------------------------------------------- #
-#  phase 1 : full AdaLFL (meta-training)                                      #
-# --------------------------------------------------------------------------- #
 def meta_train(model, loader, loss_id, n_steps, lr, tokenizer):
 
     dev = next(model.parameters()).device
@@ -86,12 +83,11 @@ def meta_train(model, loader, loss_id, n_steps, lr, tokenizer):
 
         torch.cuda.empty_cache()
 
-# --------------------------------------------------------------------------- #
-#  phase 2 : self-loss-only fine-tuning                                       #
-# --------------------------------------------------------------------------- #
+
 def self_train(model, loader, loss_id, n_steps, lr):
 
     dev = next(model.parameters()).device
+    critic = copy.deepcopy(model).to(dev)
     opt = optim.AdamW(model.parameters(), lr=lr)
 
     for step in range(n_steps):
@@ -119,11 +115,11 @@ def self_train(model, loader, loss_id, n_steps, lr):
             B, L = train_y.shape
             interleaved = interleaved.view(B, L * 3)
 
-            pred_meta = model(interleaved)
+            pred_meta = critic(interleaved)
             idx = torch.arange(2, interleaved.size(1), 3, device=interleaved.device)
             pred_target = pred_meta[:, idx, :].argmax(dim=-1)
         
-        pred_target = pred_target.clone()
+        pred_target = pred_target.clone().detach()
         loss = F.cross_entropy(pred.permute(0, 2, 1), pred_target)
 
         opt.zero_grad()
@@ -142,9 +138,7 @@ def self_train(model, loader, loss_id, n_steps, lr):
         del loss_flat, stacked, interleaved, loss, pred_meta, idx, pred_target, val_loss
         torch.cuda.empty_cache()
 
-# --------------------------------------------------------------------------- #
-#  main                                                                       #
-# --------------------------------------------------------------------------- #
+
 def main(cfg):
 
     device = "cuda"
@@ -183,7 +177,7 @@ if __name__ == "__main__":
     ap.add_argument("--data_dir",    default="./data")
     ap.add_argument("--batch",       type=int,   default=128)
     ap.add_argument("--block",       type=int,   default=128)
-    ap.add_argument("--meta_steps",  type=int,   default=2000)
+    ap.add_argument("--meta_steps",  type=int,   default=1000)
     ap.add_argument("--self_steps",  type=int,   default=1000)
     ap.add_argument("--lr_meta",     type=float, default=1e-4)
     ap.add_argument("--lr_self",     type=float, default=1e-4)
